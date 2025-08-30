@@ -1,0 +1,101 @@
+#!/bin/bash
+# Union-restore a folder from ALL APFS Time Machine snapshots (other Mac)
+# Copies only files that don't already exist at DEST (keeps first-seen version).
+# Requires: macOS (APFS), sudo (for mounting snapshots).
+
+set -euo pipefail
+
+# ======= EDIT THESE =======
+SRC_VOL="/Volumes/Backups-mba"		# The mounted TM volume (as seen in Finder)
+DEST="/Volumes/LaCie/_mba"			# Where to copy files
+USERNAME="ppervoy"					# Old Mac short name
+
+# Folder(s) inside each snapshot to try (in order). Adjust as needed.
+REL_PATHS=(
+  "Data/Users/$USERNAME/Music"
+)
+# ==========================
+
+# Resolve the device node for the APFS volume (e.g., /dev/disk6s4)
+DEV="$(diskutil info "$SRC_VOL" | awk -F': *' '/Device Node/ {print $2}')"
+if [[ -z "${DEV:-}" ]]; then
+  echo "ERROR: Could not resolve device node for $SRC_VOL"
+  exit 1
+fi
+
+# Gather snapshot names cleanly (strip pipes/indent, keep just the name)
+SNAPS=()
+while IFS= read -r line; do
+  name=$(echo "$line" | sed -n 's/.*Name:[[:space:]]*//p')
+  [[ -n "$name" ]] && SNAPS+=("$name")
+done < <(diskutil apfs listSnapshots "$SRC_VOL")
+
+if (( ${#SNAPS[@]} == 0 )); then
+  echo "ERROR: No Time Machine snapshots found on $SRC_VOL"
+  exit 1
+fi
+
+echo ">>> Found ${#SNAPS[@]} snapshots on $SRC_VOL:"
+i=1
+for snap in "${SNAPS[@]}"; do
+  printf "  %2d) %s\n" "$i" "$snap"
+  ((i++))
+done
+echo
+
+read -r -p "Process ALL snapshots for a union copy? [Y/n]: " yn
+if [[ "${yn:-Y}" =~ ^[Nn]$ ]]; then
+  read -r -p "Enter a single snapshot number to process: " idx
+  if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#SNAPS[@]} )); then
+    echo "Invalid selection."; exit 1
+  fi
+  SNAPS=("${SNAPS[$((idx-1))]}")
+fi
+
+mkdir -p "$DEST"
+
+for SNAP in "${SNAPS[@]}"; do
+  DATE="${SNAP##*.TimeMachine.}"; DATE="${DATE%.backup}"
+  MNT="/Volumes/TMSnap_${DATE}"
+
+  echo ">>> Mounting snapshot: $SNAP -> $MNT"
+  sudo mkdir -p "$MNT"
+  # If mountpoint is busy from a previous run, unmount it
+  if mount | grep -q "on $MNT "; then
+    sudo diskutil unmount force "$MNT" >/dev/null 2>&1 || true
+  fi
+
+  if ! sudo mount_apfs -s "$SNAP" "$DEV" "$MNT"; then
+    echo "!!! Failed to mount $SNAP (device busy or name mismatch). Skipping."
+    sudo diskutil unmount force "$MNT" >/dev/null 2>&1 || true
+    rmdir "$MNT" 2>/dev/null || true
+    continue
+  fi
+
+  # Find the first existing candidate path inside the snapshot
+  SRC=""
+  for REL in "${REL_PATHS[@]}"; do
+    CAND="$MNT/$DATE.backup/$REL"
+    if [[ -d "$CAND" ]]; then
+      SRC="$CAND"; break
+    fi
+  done
+
+  if [[ -z "$SRC" ]]; then
+    echo "??? Path not found in $SNAP. Tried:"
+    for REL in "${REL_PATHS[@]}"; do
+      echo "    $MNT/$DATE/$REL"
+    done
+  else
+    echo ">>> rsync from: $SRC"
+    echo ">>> rsync to:   $DEST"
+    rsync -av --ignore-existing "$SRC/" "$DEST/"
+  fi
+
+  echo ">>> Unmounting $MNT"
+  sudo diskutil unmount force "$MNT" >/dev/null || true
+  rmdir "$MNT" 2>/dev/null || true
+done
+
+echo "✅ Done. Union copy complete at: $DEST"
+echo "   (If permissions look odd:  sudo chown -R $(whoami):staff \"$DEST\")"
