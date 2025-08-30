@@ -1,0 +1,1 @@
+Here is a simple script that walks your Time Machine sparsebundles (each increment of backup is not saved in folder, but a sprasebundle) collecting all files ever existed in the folder. E.g. you created file A, than B, later C and removed B. All three files should be visible in the resulting folder.
